@@ -12,12 +12,26 @@ import {
   EvidenceIntegrityError,
 } from "../../domain/evidenceErrors.js";
 import { err, ok, type Result } from "../../domain/result.js";
-import type { AnalysisResourceConstraintError } from "../../domain/analysisErrorCore.js";
-import { AnalysisCancelledError } from "../../domain/analysisErrorCore.js";
-import { readJsonObjectMembersFile, writeTextFile } from "../JsonFiles.js";
+import {
+  type AnalysisInputError,
+  type AnalysisResourceConstraintError,
+  AnalysisCancelledError,
+} from "../../domain/analysisErrorCore.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
+import { analysisErrorWithCleanupFailure } from "../../domain/analysisErrorCleanup.js";
+import { ProviderCleanupError } from "../../domain/providerCleanupError.js";
+import {
+  jsonFileCleanupPrimary,
+  readJsonObjectMembersFile,
+  writeTextFile,
+} from "../JsonFiles.js";
+import { RegularFileRetainedCleanupFailure } from "../RegularFileRead.js";
 import { RegularFileCleanupFailure } from "../../filesystem/OwnedRegularFile.js";
 import type { JsonObjectMemberReader } from "../JsonInputFile.js";
+import { AnalysisCleanupLeaseGroup } from "../../artifacts/AnalysisCleanupLease.js";
 import type { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
+
+const READ_OPERATION = "open_binary";
 
 type SnapshotFailure = EvidenceFileError | EvidenceIntegrityError;
 
@@ -26,12 +40,7 @@ export const readAnalysisSnapshot = async (
   path: string,
   signal?: AbortSignal,
   resources?: ArtifactResourceScope,
-): Promise<
-  Result<
-    AnalysisSnapshot,
-    SnapshotFailure | AnalysisResourceConstraintError | AnalysisCancelledError
-  >
-> => {
+): Promise<Result<AnalysisSnapshot, AnalysisError>> => {
   const entries = snapshotEntryReader("provider");
   const workflows = snapshotEntryReader("workflow");
   const header: Record<string, unknown> = {};
@@ -62,28 +71,89 @@ export const readAnalysisSnapshot = async (
         ]),
         metadata,
       ],
+      () => {
+        try {
+          return ok(
+            parsePreparedAnalysisSnapshot(
+              header,
+              entries.finish(),
+              workflows.finish(),
+            ),
+          );
+        } catch (cause: unknown) {
+          return err(
+            new EvidenceIntegrityError(snapshotValidationMessage(cause), {
+              cause,
+            }),
+          );
+        }
+      },
       signal,
       resources,
+      READ_OPERATION,
     );
     if (!loaded.ok) return loaded;
-    signal?.throwIfAborted();
-    const snapshot = parsePreparedAnalysisSnapshot(
-      header,
-      entries.finish(),
-      workflows.finish(),
-    );
     // Deliver queued cancellation before handing a complete cache to the session.
     await setImmediate();
-    signal?.throwIfAborted();
-    return ok(snapshot);
+    if (signal?.aborted === true) return err(snapshotCancelled(signal));
+    return loaded;
   } catch (cause: unknown) {
+    // Caller reasons are opaque, including objects shaped like file failures.
+    if (signal?.aborted === true && cause === signal.reason)
+      return err(snapshotCancelled(signal));
+    if (cause instanceof RegularFileRetainedCleanupFailure)
+      return err(snapshotCleanupFailure(cause, signal));
+    // Without a retaining scope this failure is the descriptor's only owner.
     if (cause instanceof RegularFileCleanupFailure) throw cause;
-    if (signal?.aborted === true)
-      return err(new AnalysisCancelledError("read_evidence_file", { cause }));
-    return err(
-      new EvidenceIntegrityError(snapshotValidationMessage(cause), { cause }),
-    );
+    return err(snapshotReadFailure(cause, signal));
   }
+};
+
+const snapshotCancelled = (signal: AbortSignal): AnalysisCancelledError =>
+  new AnalysisCancelledError(READ_OPERATION, { cause: signal.reason });
+
+const snapshotReadFailure = (
+  cause: unknown,
+  signal: AbortSignal | undefined,
+): EvidenceIntegrityError | AnalysisCancelledError =>
+  signal?.aborted === true
+    ? snapshotCancelled(signal)
+    : new EvidenceIntegrityError(snapshotValidationMessage(cause), { cause });
+
+/**
+ * Report a snapshot descriptor that the caller's scope still retains after its
+ * close retry failed. The error stays bound to that exact lease, so its
+ * resources clear only when the scope later releases the descriptor.
+ */
+const snapshotCleanupFailure = (
+  failure: RegularFileRetainedCleanupFailure<
+    Result<
+      AnalysisSnapshot,
+      | AnalysisInputError
+      | AnalysisResourceConstraintError
+      | EvidenceIntegrityError
+    >
+  >,
+  signal: AbortSignal | undefined,
+): AnalysisError => {
+  const cleanup = new ProviderCleanupError(
+    "rea",
+    failure.cleanup.resources,
+    { reason: failure.cleanup.reason },
+    {
+      cause: failure,
+      operation: READ_OPERATION,
+      remediationAction:
+        "The snapshot file handle is still retained. Call close_binary to retry cleanup before opening another target.",
+    },
+  );
+  const primary = jsonFileCleanupPrimary(failure, READ_OPERATION, signal);
+  const error =
+    primary === undefined
+      ? cleanup
+      : analysisErrorWithCleanupFailure(primary, cleanup, READ_OPERATION);
+  new AnalysisCleanupLeaseGroup(error, [failure.cleanupLease]);
+  return error;
 };
 
 const snapshotEntryReader = (kind: "provider" | "workflow") => {

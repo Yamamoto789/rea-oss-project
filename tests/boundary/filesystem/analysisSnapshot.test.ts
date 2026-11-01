@@ -29,6 +29,7 @@ import {
 import { createEvidence } from "../../../src/domain/evidence.js";
 import { createEvidenceBundle } from "../../../src/domain/evidenceBundle.js";
 import { readJsonObjectFile } from "../../../src/application/JsonInputFile.js";
+import { ok } from "../../../src/domain/result.js";
 import { RegularFileChangedError } from "../../../src/filesystem/RegularFile.js";
 import { OwnedFileHandle } from "../../../src/filesystem/OwnedFileHandle.js";
 import { RegularFileCleanupFailure } from "../../../src/filesystem/OwnedRegularFile.js";
@@ -288,7 +289,10 @@ describe("analysis snapshot member decoding", () => {
     try {
       expect(await pending).toMatchObject({
         ok: false,
-        error: { _tag: "AnalysisCancelledError" },
+        error: {
+          _tag: "AnalysisCancelledError",
+          cause: controller.signal.reason,
+        },
       });
       expect(reads.readCount).toBe(1);
     } finally {
@@ -358,7 +362,9 @@ describe("analysis snapshot file ownership", () => {
       ],
     ]);
     await expect(
-      readJsonObjectFile(path, "test-input", [reader, new Map()]),
+      readJsonObjectFile(path, "test-input", [reader, new Map()], () =>
+        ok(undefined),
+      ),
     ).rejects.toBeInstanceOf(RegularFileChangedError);
     expect((await readFile(path, "utf8")).trim()).toBe('{"value":2}');
   });
@@ -415,7 +421,7 @@ it.each([
     for (const padding of ["", " ".repeat(9 * 1024 * 1024)]) {
       await writeFile(path, `${padding}{"value":1}`);
       await expect(
-        readJsonObjectFile(path, "test-input", [members]),
+        readJsonObjectFile(path, "test-input", [members], () => ok(undefined)),
       ).rejects.toBe(failure);
     }
   },

@@ -39,6 +39,7 @@ import {
   AnalysisResourceConstraintError,
 } from "../domain/analysisErrorCore.js";
 import { err, ok, type Result } from "../domain/result.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 
 type JsonInputFileFailure =
   | AnalysisInputError
@@ -86,7 +87,7 @@ const readPhysicalJsonInput = async <Value>(
   }
 };
 
-const withJsonInputFile = <Value>(
+const withJsonInputFile = <Value extends Result<unknown, AnalysisError>>(
   path: string,
   read: (handle: FileHandle, stats: Stats) => Promise<Value>,
   options: Pick<RegularFileReadOptions, "signal" | "resources">,
@@ -94,6 +95,8 @@ const withJsonInputFile = <Value>(
   withRegularFile(path, read, {
     ...options,
     cancellationFailure: (reason) => new JsonInputCancellationFailure(reason),
+    // Syntax and semantic failures are decided before close; they stay primary.
+    completedFailure: (value) => !value.ok,
   }).catch((cause: unknown) => {
     if (cause instanceof RegularFileReadFailure) throw cause.operationCause;
     throw cause;
@@ -112,6 +115,18 @@ const withJsonInputPipeline = async <Value>(
   else signal.addEventListener("abort", cancel, { once: true });
   try {
     return await run(controller.signal);
+  } catch (cause: unknown) {
+    // Node 22 wraps this pipeline's own abort reason; normalize it at its owner.
+    if (
+      controller.signal.aborted &&
+      cause instanceof Error &&
+      cause.name === "AbortError" &&
+      "code" in cause &&
+      cause.code === "ABORT_ERR" &&
+      cause.cause === controller.signal.reason
+    )
+      throw controller.signal.reason;
+    throw cause;
   } finally {
     signal.removeEventListener("abort", cancel);
   }
@@ -142,13 +157,17 @@ export interface JsonObjectMemberReader {
 }
 
 /** Scan selected members without retaining skipped subtrees or prior array items. */
-export const readJsonObjectFile = (
+export const readJsonObjectFile = <
+  Value,
+  Failure extends AnalysisError = never,
+>(
   path: string,
   operation: string,
   scans: readonly ReadonlyMap<string, JsonObjectMemberReader>[],
+  complete: () => Result<Value, Failure>,
   signal?: AbortSignal,
   resources?: ArtifactResourceScope,
-): Promise<Result<void, JsonInputFileFailure>> =>
+): Promise<Result<Value, JsonInputFileFailure | Failure>> =>
   withJsonInputFile(
     path,
     async (handle, stats) => {
@@ -199,7 +218,7 @@ export const readJsonObjectFile = (
                 }
               }
             }
-          return ok(undefined);
+          return complete();
         }
         for (const members of scans) {
           const hash = createHash("sha256");
@@ -288,7 +307,7 @@ export const readJsonObjectFile = (
             throw new RegularFileChangedError(path);
           previousDigest = digest;
         }
-        return ok(undefined);
+        return complete();
       } catch (cause: unknown) {
         if (physicalRead.failure !== undefined) throw physicalRead.failure;
         const failure = jsonReadFailure(cause, operation, stats.size, path);
